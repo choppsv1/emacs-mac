@@ -5212,6 +5212,194 @@ usage: (mac-start-animation FRAME-OR-WINDOW &rest PROPERTIES) */)
 
 
 /***********************************************************************
+		           Notifications
+***********************************************************************/
+
+#ifdef HAVE_OSX_USER_NOTIFICATIONS
+
+extern Lisp_Object mac_notification_add_category (Lisp_Object category_name,
+                                                  Lisp_Object action_list);
+
+extern Lisp_Object mac_notification_get_delivered (void);
+extern Lisp_Object mac_notification_get_settings (void);
+
+extern Lisp_Object mac_notification_send (Lisp_Object title,
+                                          Lisp_Object message,
+                                          Lisp_Object arg_plist);
+
+DEFUN ("mac-notification-add-category", Fmac_notification_add_category,
+       Smac_notification_add_category,
+       2, 2, 0,
+       doc: /* Add a category of notifications and their actions
+
+Any notifications using categories defined this way cannot be used to
+launch Emacs as the category won't be registered with when Emacs first
+launches, so the notification will not be delivered.
+
+Three predefined categories exist, "Generic", "Show" and "Dismiss"
+with the following properies:
+
+"Generic"  -- Displays the notification with no action buttons.
+"Show"     -- Displays the notification with a "Show" action
+              button. If this button is clicked it will launch Emacs
+              into the foreground. The KEY delivered is "SHOW_ACTION".
+"Dismiss"  -- Displays the notification with a "Dismiss" action
+              button. If "Dismiss" is selected it does not launch
+              Emacs into the foreground. The KEY delivered is
+              "DISMISS_ACTION".
+
+CATEGORY_ID -- Name to uniquely identify the new category.
+ACTION_LIST -- list of (KEY TITLE KEY TITLE ..), KEYs are passed to
+               on-action function when action is selected.
+
+XXX add action options for authorized (unlocked), destructive, and
+foreground.
+
+usage: (mac-notification-add-category CATEGORY_ID ACTION_LIST)  */)
+    (Lisp_Object category_name, Lisp_Object action_list)
+{
+  CHECK_STRING(category_name);
+  return mac_notification_add_category(category_name, action_list);
+}
+
+DEFUN ("mac-notification-get-delivered", Fmac_notification_get_delivered,
+       Smac_notification_get_delivered, 0, 0, 0,
+       doc: /* Get a list of delivered notifications.
+
+usage: (mac-notification-get-delivered)  */)
+    (void)
+{
+  return mac_notification_get_delivered();
+}
+
+DEFUN ("mac-notification-get-settings", Fmac_notification_getsettings,
+       Smac_notification_get_settings, 0, 0, 0,
+       doc: /* Get a the settings (permissions) for notifications.
+
+usage: (mac-notification-get-settings)  */)
+    (void)
+{
+  return mac_notification_get_settings();
+}
+
+DEFUN ("mac-notification-send", Fmac_notification_send, Smac_notification_send,
+       2, MANY, 0,
+       doc: /* Post a notification with the given TITLE and MESSAGE.
+
+Additional parameters for the notification given in PARAMS. An
+ID representing this notification is returned.
+
+Three predefined categories exist, "Generic", "Show" and "Dismiss"
+with the following properies:
+
+"Generic"  -- Displays the notification with no action buttons. Emacs
+              will be activated/launched.
+"Show"     -- Displays the notification with a "Show" action button. If
+              this button is clicked it will activate/launch Emacs
+              into the foreground. The KEY delivered is "SHOW_ACTION".
+"Dismiss"  -- Displays the notification with a "Dismiss" action
+              button. If "Dismiss" is selected it does not
+              activate/launch Emacs into the foreground.
+              The KEY delivered is "DISMISS_ACTION".
+
+The following additional parameters are supported:
+
+:category              -- category which specified the actions that
+                         will be associated with this
+                         notification. Either one of the predefined
+                         categories (default is "Generic") or ones
+                         defined by `mac-notification-add-category`.
+:on-action FUNC       -- Function to call when an action is invoked,
+                         passed KEY of the selected action. KEY is
+                         "default" if the content area was selected.
+:on-close FUNC        -- Function to when notification is closed,
+                         function is passed `expired', `dismissed',
+                         `close-notification', or
+                         `undefined'. Currently only
+                         'close-notification' 'dimissed' are
+                         delivered.
+:replaces-id NOTIFID  -- Notification ID that this should replace.
+:sound-name SOUNDNAME -- Play the system sound identified by SOUNDNAME.
+:subtitle SUBTITLE    -- Display the given SUBTITLE under the TITLE.
+:alert BOOLEAN        -- NOTIMPL: Indicates an alert (no timeout)
+                         instead of notification.
+
+usage: (mac-notification-send TITLE MESSAGE &rest PARAMS)  */)
+    (ptrdiff_t nargs, Lisp_Object *args)
+{
+  Lisp_Object title = args[0];
+  Lisp_Object message = args[1];
+  char *c_title, *c_message;
+
+  assert(nargs >= 2);
+  CHECK_STRING(title);
+  CHECK_STRING(message);
+  return mac_notification_send(title, message, Flist(nargs - 2, args + 2));
+}
+#endif /* HAVE_OSX_USER_NOTIFICATIONS */
+
+#ifdef HAVE_OSX_FOUNDATION_NOTIFICATIONS
+
+extern Lisp_Object mac_legacy_notification_send (Lisp_Object title,
+                                                 Lisp_Object message,
+                                                 Lisp_Object arg_plist);
+
+extern Lisp_Object mac_legacy_notification_get_delivered (void);
+
+DEFUN ("mac-notification-get-delivered", Fmac_legacy_notification_get_delivered,
+       Smac_legacy_notification_get_delivered, 0, 0, 0,
+       doc: /* Get a list of delivered notifications.
+
+usage: (mac-legacy-notification-get-delivered)  */)
+    (void)
+{
+  return mac_legacy_notification_get_delivered();
+}
+
+DEFUN ("mac-legacy-notification-send", Fmac_legacy_notification_send, Smac_legacy_notification_send,
+       2, MANY, 0,
+       doc: /* Post a notification with the given TITLE and MESSAGE
+               using the deprecated (since 11.0) OSX notification API.
+
+This interface was updated to a new API in version 10.14 of OSX and
+deprecated in 11.0. You cannot mix and match. If the new API is used
+then legacy notifications will not be displayed.
+
+Additional parameters for the notification given in PARAMS. An
+ID representing this notification is returned.
+
+The following additional parameters are supported:
+
+:actions              -- list of (KEY TITLE KEY TITLE ..), KEYs are
+                         passed to on-action function when action is
+                         selected.
+:on-action FUNC       -- Function to call when an action is invoked,
+                         passed KEY of the selected action. KEY is
+                         "default" if the content area was selected.
+:on-close FUNC        -- Function to when notification is closed,
+                         function is passed `expired', `dismissed',
+                         `close-notification', or
+                         `undefined'. Currently only
+                         'close-notification' is delivered.
+:sound-name SOUNDNAME -- Play the system sound identified by SOUNDNAME.
+
+usage: (mac-legacy-notification-send TITLE MESSAGE &rest PARAMS)  */)
+    (ptrdiff_t nargs, Lisp_Object *args)
+{
+  Lisp_Object title = args[0];
+  Lisp_Object message = args[1];
+  char *c_title, *c_message;
+
+  assert(nargs >= 2);
+  CHECK_STRING(title);
+  CHECK_STRING(message);
+  return mac_legacy_notification_send(title, message, Flist(nargs - 2, args + 2));
+}
+
+#endif /* HAVE_OSX_FOUNDATION_NOTIFICATIONS */
+
+
+/***********************************************************************
 			    Initialization
  ***********************************************************************/
 
@@ -5322,11 +5510,36 @@ syms_of_macfns (void)
   DEFSYM (Qpage_curl_with_shadow, "page-curl-with-shadow");
   DEFSYM (Qripple, "ripple");
   DEFSYM (Qswipe, "swipe");
+  /* Notification symbols */
+#if defined(HAVE_OSX_USER_NOTIFICATIONS) || defined(HAVE_OSX_FOUNDATION_NOTIFICATIONS)
+  DEFSYM (Qclose_notification, "close-notification");
+  DEFSYM (Qdismissed, "dismissed");
+  DEFSYM (QCon_action, ":on-action");
+  DEFSYM (QCon_close, ":on-close");
+  DEFSYM (QCsound_name, ":sound-name");
+#if defined(HAVE_OSX_USER_NOTIFICATIONS)
+  DEFSYM (Qauthorized, "authorized");
+  DEFSYM (Qdenied, "denied");
+  DEFSYM (Qnot_determined, "not-determined");
+  DEFSYM (Qprovisional, "provisional");
+  DEFSYM (QCsubtitle, ":subtitle");
+#endif
+#if defined(HAVE_OSX_FOUNDATION_NOTIFICATIONS)
+  DEFSYM (QCreplaces_id, ":replaces-id");
+#endif
+#endif
 
   Fput (Qundefined_color, Qerror_conditions,
 	pure_list (Qundefined_color, Qerror));
   Fput (Qundefined_color, Qerror_message,
 	build_pure_c_string ("Undefined color"));
+
+#if defined(HAVE_OSX_USER_NOTIFICATIONS) || defined(HAVE_OSX_FOUNDATION_NOTIFICATIONS)
+  DEFVAR_LISP ("debug-mac-notifications", Vdebug_mac_notifications,
+               doc: /* non-nil enabled debug logging in notification
+                       code */);
+  Vdebug_mac_notifications = Qnil;
+#endif
 
   DEFVAR_LISP ("x-pointer-shape", Vx_pointer_shape,
     doc: /* The shape of the pointer when over text.
@@ -5498,7 +5711,17 @@ Chinese, Japanese, and Korean.  */);
   defsubr (&Smac_frame_edges);
   defsubr (&Smac_frame_list_z_order);
   defsubr (&Smac_frame_restack);
+#ifdef HAVE_OSX_FOUNDATION_NOTIFICATIONS
+  defsubr (&Smac_legacy_notification_get_delivered);
+  defsubr (&Smac_legacy_notification_send);
+#endif /*  HAVE_OSX_FOUNDATION_NOTIFICATIONS */
   defsubr (&Smac_mouse_absolute_pixel_position);
+#ifdef HAVE_OSX_USER_NOTIFICATIONS
+  defsubr (&Smac_notification_add_category);
+  defsubr (&Smac_notification_get_delivered);
+  defsubr (&Smac_notification_get_settings);
+  defsubr (&Smac_notification_send);
+#endif /* HAVE_OSX_USER_NOTIFICATIONS */
   defsubr (&Smac_set_mouse_absolute_pixel_position);
   defsubr (&Sx_create_frame);
   defsubr (&Sx_open_connection);

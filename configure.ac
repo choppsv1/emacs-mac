@@ -5592,6 +5592,23 @@ case "$opsys" in
    ## only costs about 1.5K of wasted binary space.
    headerpad_extra=1000
    if test "$HAVE_MACGUI" = "yes"; then
+     AC_MSG_CHECKING([for Mac OS X 10.8 or newer])
+     AC_CACHE_VAL(emacs_cv_mac_os_x_max_allowed_10_08,
+     [AC_LINK_IFELSE([AC_LANG_PROGRAM([[
+#ifdef HAVE_AVAILABILITYMACROS_H
+#include <AvailabilityMacros.h>
+#endif]],
+[[#if MAC_OS_X_VERSION_MAX_ALLOWED >= 1080 && MAC_OS_X_VERSION_MIN_REQUIRED > 1020
+fail;
+#endif
+]])], emacs_cv_mac_os_x_max_allowed_10_08=no, emacs_cv_mac_os_x_max_allowed_10_08=yes)])
+     AC_MSG_RESULT([$emacs_cv_mac_os_x_max_allowed_10_08])
+
+     if test "${emacs_cv_mac_os_x_max_allowed_10_08}" = yes; then
+       AC_DEFINE(HAVE_OSX_FOUNDATION_NOTIFICATIONS, 1, [Define to allow use of legacy MacOS notifications.])
+     fi
+
+
      AC_MSG_CHECKING(Mac OS X version max allowed >= 10.11)
      AC_CACHE_VAL(emacs_cv_mac_os_x_max_allowed_10_11,
      [AC_LINK_IFELSE([AC_LANG_PROGRAM([[
@@ -5612,6 +5629,23 @@ fail;
      else
        AC_MSG_RESULT(before 10.11)
      fi
+
+     AC_MSG_CHECKING([for Mac OS X 10.14 or newer])
+     AC_CACHE_VAL(emacs_cv_mac_os_x_max_allowed_10_14,
+     [AC_LINK_IFELSE([AC_LANG_PROGRAM([[
+#ifdef HAVE_AVAILABILITYMACROS_H
+#include <AvailabilityMacros.h>
+#endif]],
+[[#if MAC_OS_X_VERSION_MAX_ALLOWED >= 1080 && MAC_OS_X_VERSION_MIN_REQUIRED > 1020
+fail;
+#endif
+]])], emacs_cv_mac_os_x_max_allowed_10_14=no, emacs_cv_mac_os_x_max_allowed_10_14=yes)])
+
+     AC_MSG_RESULT([$emacs_cv_mac_os_x_max_allowed_10_14])
+     if test "${emacs_cv_mac_os_x_max_allowed_10_14}" = yes; then
+       AC_DEFINE(HAVE_OSX_USER_NOTIFICATIONS, 1, [Define to allow use of newer MacOS notifications.])
+     fi
+
      AC_MSG_CHECKING(Mac OS X version min required >= 11)
      AC_CACHE_VAL(emacs_cv_mac_os_x_min_required_11,
      [AC_LINK_IFELSE([AC_LANG_PROGRAM([[
@@ -5631,7 +5665,11 @@ fail;
      else
        AC_MSG_RESULT(before 11)
      fi
+
      libs_macgui="-framework Carbon -framework WebKit -framework Quartz -framework QuartzCore -framework IOKit -framework OSAKit -framework Accelerate -framework IOSurface $libs_metal $libs_uniform_type_identifiers -framework Cocoa"
+     if test "${emacs_cv_mac_os_x_max_allowed_10_14}" = yes; then
+         libs_macgui="$libs_macgui -framework UserNotifications"
+     fi
      headerpad_extra=BD0
    else
      libs_macgui=$libs_nsgui

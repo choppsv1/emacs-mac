@@ -81,9 +81,22 @@ CF_AUTORELEASE (CFTypeRef X)
 }
 #endif
 
+static void mac_within_lisp_deferred (void (^block) (void));
+
 /************************************************************************
 			       General
  ************************************************************************/
+
+/*
+ * There is code included under this define which should support the
+ * newer notification framework introduced in macos 10.14; however,
+ * it never asks for permission like it should, and so permission is
+ * never granted and no notifications are posted. Someone should debug
+ * why this is not working and replace the current legacy/deprecated
+ * notification code.
+ */
+#undef NEWER_NOTIFICATION_NO_PERMISSION_FIXED
+
 
 enum {
   ANY_MOUSE_EVENT_MASK = (NSEventMaskLeftMouseDown | NSEventMaskLeftMouseUp
@@ -1381,6 +1394,10 @@ static bool handling_queued_nsevents_p;
 - (void)dealloc
 {
   [[NSNotificationCenter defaultCenter] removeObserver:self];
+#ifdef HAVE_OSX_USER_NOTIFICATIONS
+  [notificationCategories release];
+  [notificationIdentifiers release];
+#endif
   for (NSString *keyPath in observedKeyPaths)
     [NSApp removeObserver:self forKeyPath:keyPath];
 #if !USE_ARC
@@ -1439,6 +1456,57 @@ static bool handling_queued_nsevents_p;
 
   [NSApp registerUserInterfaceItemSearchHandler:self];
   Vmac_help_topics = Qnil;
+
+#ifdef HAVE_OSX_USER_NOTIFICATIONS
+  /*
+   * Register the predefined notification categories.
+   */
+  UNUserNotificationCenter* center = [UNUserNotificationCenter currentNotificationCenter];
+  center.delegate = emacsController;
+
+  UNNotificationCategory* genericCategory =
+    [UNNotificationCategory
+      categoryWithIdentifier:@"Generic"
+                     actions:@[]
+           intentIdentifiers:@[]
+                     options:UNNotificationCategoryOptionCustomDismissAction];
+
+  UNNotificationCategory* showCategory =
+    [UNNotificationCategory
+      categoryWithIdentifier:@"Show"
+                     actions:@[[UNNotificationAction
+                                 actionWithIdentifier:@"SHOW_ACTION"
+                                                title:@"Show"
+                                              options:UNNotificationActionOptionForeground]]
+           intentIdentifiers:@[]
+                     options:UNNotificationCategoryOptionCustomDismissAction];
+  UNNotificationCategory* dismissCategory =
+    [UNNotificationCategory categoryWithIdentifier:@"Dismiss"
+                                           actions:@[[UNNotificationAction
+                                                       actionWithIdentifier:@"DISMISS_ACTION"
+                                                                      title:@"Dismiss"
+                                                                    options:UNNotificationActionOptionNone]]
+                                 intentIdentifiers:@[]
+                                           options:UNNotificationCategoryOptionCustomDismissAction];
+
+  /* Save the initial set so lisp user can add to it later */
+
+  notificationCategories = [[NSMutableSet alloc] initWithObjects:showCategory, genericCategory, dismissCategory, nil];
+
+  [center setNotificationCategories:notificationCategories];
+
+  /* Create dictionary to store allocated identifiers */
+  notificationIdentifiers = [[NSMutableDictionary alloc] init];
+
+  /*
+   * Request permission to post notifications.
+   */
+  [center requestAuthorizationWithOptions:(UNAuthorizationOptionAlert + UNAuthorizationOptionSound)
+                        completionHandler:^(BOOL granted, NSError * _Nullable error){
+      if (!granted)
+        NSLog(@"[!] XXX No permissions to post notifications: %@", error);
+    }];
+#endif
 
 #if MAC_OS_X_VERSION_MAX_ALLOWED >= 101500
   /* Work around animation effect glitches for executables linked on
@@ -2178,7 +2246,604 @@ emacs_windows_need_display_p (void)
     }
 }
 
+/*
+ * Notifications
+ */
+
+static void mac_within_lisp_deferred (void (^block) (void));
+
+NSData *
+mac_objptr_as_data(Lisp_Object object)
+{
+    void *vdata = lisp_h_XLP(object);
+    return [NSData dataWithBytes:&vdata
+                          length:sizeof(vdata)];
+}
+
+Lisp_Object
+mac_callable_from_data(NSData *data)
+{
+    void *vcallback;
+    if (!data)
+        return Qnil;
+    [data getBytes:&vcallback
+            length:sizeof(vcallback)];
+    return lisp_h_XPL(vcallback);
+}
+
+Lisp_Object
+mac_callable_from_sym_name(NSString *sym_name)
+{
+  if (!sym_name)
+    return Qnil;
+
+  Lisp_Object symbol = Fintern([sym_name UTF8LispString], Qnil);
+  if (Ffboundp(symbol) == Qnil)
+    return Qnil;
+
+  return symbol;
+}
+
+/*
+  (mac-notification-send "title" "this is a message"
+  :on-close (lambda (what) (message "on-close: %s" what))
+  :on-action  (lambda (what) (message "on-action: %s" what))
+  :actions '("A1" "ATitle" "B1" "BTitle")
+  :sound-name "Woosh")
+
+  (mac-notification-add-category "Testing" '("A1" "ATitle" "B1" "BTitle"))
+  (mac-notification-send "title" "this is a message"
+  :category "Testing"
+  :on-close (lambda (what) (message "on-close: %s" what))
+  :on-action  (lambda (what) (message "on-action: %s" what))
+  :sound-name "Looking Up")
+
+  (mac-delivered-notification)
+*/
+
+static Lisp_Object
+_mac_notification_clicked_lisp_error(enum nonlocal_exit nle, Lisp_Object o)
+{
+  Lisp_Object s = CALLN(Fformat, build_string("%s"), o);
+  if (!NILP(Vdebug_mac_notifications))
+    {
+      if (s == Qnil)
+        NSLog(@"[!] _mac_notification_clicked_lisp_error non-local-exit: %d: nil", nle);
+      else
+        NSLog(@"[!] _mac_notification_clicked_lisp_error non-local-exit: %d: %@", nle,
+              [NSString stringWithUTF8LispString:s]);
+    }
+  /* The user should hear about this -- this seems to be crashing */
+  // message_with_string("_mac_notification_clicked_lisp_error: %s", s, 0);
+  return Qt;
+}
+
+struct _click_args {
+  Lisp_Object lid, lkey, on_action, on_close, close_reason;
+};
+
+static Lisp_Object
+_mac_notification_clicked_lisp(void *arg)
+{
+  if (!NILP(Vdebug_mac_notifications))
+    NSLog(@"[!] XXX click_lisp");
+
+  struct _click_args *args = (struct _click_args *)arg;
+  if (!NILP(args->lkey) && !NILP(args->on_action))
+    call2(args->on_action, args->lid, args->lkey);
+
+  if (!NILP(args->on_close))
+    call2(args->on_close, args->lid, args->close_reason);
+
+  Lisp_Object cb = intern("mac-notification-receive");
+  if (!NILP(Ffboundp(cb)))
+    call3(cb, args->lid, args->lkey, args->close_reason);
+
+  return Qt;
+}
+
+static void
+_mac_notification_clicked(NSString *identifier,
+                          NSDictionary<NSString *,id> *options,
+                          BOOL is_dismiss,
+                          NSString *key)
+{
+  NSData *action_data = MRC_RETAIN([options valueForKey:@"on-action-closure"]);
+  NSString *action_sym = MRC_RETAIN([options valueForKey:@"on-action-symbol"]);
+  NSData *close_data = MRC_RETAIN([options valueForKey:@"on-close-closure"]);
+  NSString *close_sym = MRC_RETAIN([options valueForKey:@"on-close-symbol"]);
+  MRC_RETAIN(identifier);
+  MRC_RETAIN(key);
+
+  if (!mac_gui_thread_p ())
+    NSLog(@"[!] XXX UNEXPECTED NOT IN GUI THREAD");
+
+  mac_within_lisp_deferred (^{
+      if (mac_gui_thread_p ())
+        NSLog(@"[!] XXX UNEXPECTED IN GUI THREAD");
+      Lisp_Object lkey = key ? [key UTF8LispString] : Qnil;
+      Lisp_Object lid = [identifier UTF8LispString];
+      Lisp_Object on_action = Qnil;
+      Lisp_Object on_close = Qnil;
+      Lisp_Object close_reason = is_dismiss ? Qdismissed : Qclose_notification;
+
+      EmacsController *emacsController = (EmacsController *)[NSApp delegate];
+      BOOL is_old = ![emacsController->notificationIdentifiers objectForKey:identifier];
+
+      if (action_sym)
+          on_action = mac_callable_from_sym_name(action_sym);
+      else if (action_data && !is_old)
+          on_action = mac_callable_from_data(action_data);
+
+      if (close_sym)
+          on_close = mac_callable_from_sym_name(close_sym);
+      else if (close_data && !is_old)
+          on_close = mac_callable_from_data(close_data);
+
+      struct _click_args args = {lid, lkey, on_action, on_close, close_reason};
+
+      /* XXX if the user requests input during callback we hang */
+      int owfi = waiting_for_input;
+      waiting_for_input = 0;
+      Lisp_Object error = internal_catch_all (_mac_notification_clicked_lisp,
+                                              &args,
+                                              _mac_notification_clicked_lisp_error);
+      waiting_for_input = owfi;
+
+      if (!NILP(Vdebug_mac_notifications))
+        {
+          if (NILP(error))
+            NSLog(@"[!] XXX Back from clicked lisp -- no error");
+          else
+            NSLog(@"[!] XXX Back from clicked lisp with error");
+        }
+
+      if (!is_old)
+        [emacsController->notificationIdentifiers removeObjectForKey:identifier];
+
+      MRC_RELEASE(key);
+      MRC_RELEASE(identifier);
+      MRC_RELEASE(action_data);
+      MRC_RELEASE(action_sym);
+      MRC_RELEASE(close_data);
+      MRC_RELEASE(close_sym);
+    });
+}
+
+#ifdef HAVE_OSX_USER_NOTIFICATIONS
+
+
+static void
+mac_notification_clicked(UNNotificationResponse *response,
+                         BOOL is_dismiss,
+                         NSString *key)
+{
+  _mac_notification_clicked(response.notification.request.identifier,
+                            response.notification.request.content.userInfo,
+                            is_dismiss, key);
+}
+
+Lisp_Object
+mac_notification_add_category (Lisp_Object category_name,
+                               Lisp_Object action_list)
+{
+  CHECK_STRING(category_name);
+  NSString *cat_name = [NSString stringWithUTF8LispString:category_name];
+  UNNotificationCategory *category;
+
+  /* First see if a category already exists in the set with the give name */
+  EmacsController *emacsController = (EmacsController *)[NSApp delegate];
+
+  for (category in emacsController->notificationCategories)
+    {
+      if ([category.identifier isEqualToString:cat_name])
+        {
+          [emacsController->notificationCategories removeObject:category];
+          break;
+        }
+    }
+
+  NSMutableArray<UNNotificationAction *> *actions = [NSMutableArray<UNNotificationAction *> new];
+  CHECK_LIST(action_list);
+
+  for (; !NILP(CAR_SAFE(action_list)) && !NILP(CAR_SAFE(CDR_SAFE(action_list)));
+       action_list = CDR_SAFE(CDR_SAFE(action_list)))
+    {
+      Lisp_Object a_key = CAR_SAFE(action_list);
+      Lisp_Object a_title = CAR_SAFE(CDR_SAFE(action_list));
+      CHECK_STRING(a_key);
+      CHECK_STRING(a_title);
+      [actions addObject: [UNNotificationAction
+                            actionWithIdentifier:[NSString stringWithUTF8LispString:a_key]
+                                           title:[NSString stringWithUTF8LispString:a_title]
+                                         options:UNNotificationActionOptionNone]];
+    }
+  CHECK_LIST_END (action_list, action_list);
+
+  category = [UNNotificationCategory
+               categoryWithIdentifier:cat_name
+                              actions:actions
+                    intentIdentifiers:@[]
+                              options:UNNotificationCategoryOptionCustomDismissAction];
+
+  [emacsController->notificationCategories addObject:category];
+
+  if (!NILP(Vdebug_mac_notifications))
+    NSLog(@"[!] Setting new categories: %@", emacsController->notificationCategories);
+  UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
+  [center setNotificationCategories:emacsController->notificationCategories];
+
+  return Qt;
+}
+
+Lisp_Object
+mac_notification_get_delivered (void)
+{
+  UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
+  NSArray<UNNotification *> __block *na;
+
+  dispatch_semaphore_t sync = dispatch_semaphore_create(0);
+  [center getDeliveredNotificationsWithCompletionHandler:^(NSArray<UNNotification *> *notifications){
+      na = [notifications copy];
+      dispatch_semaphore_signal(sync);
+    }];
+
+  if (!NILP(Vdebug_mac_notifications))
+    NSLog(@"[!] Got delivered notifications: %@", na);
+
+  dispatch_semaphore_wait(sync, DISPATCH_TIME_FOREVER);
+  Lisp_Object result = Qnil;
+  for (int i = na.count - 1; i >= 0; i--)
+    result = Fcons([na[i].request.identifier UTF8LispString], result);
+  return result;
+}
+
+Lisp_Object
+mac_notification_get_settings(void)
+{
+  UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
+  UNNotificationSettings __block *settings;
+
+  dispatch_semaphore_t sync = dispatch_semaphore_create(0);
+  [center getNotificationSettingsWithCompletionHandler:^(UNNotificationSettings *_settings){
+      settings = [_settings copy];
+      dispatch_semaphore_signal(sync);
+    }];
+  dispatch_semaphore_wait(sync, DISPATCH_TIME_FOREVER);
+
+  if (!NILP(Vdebug_mac_notifications))
+    NSLog(@"[!] Notifcations get settings: %@", settings);
+
+  UNAuthorizationStatus status = settings.authorizationStatus;
+  Lisp_Object result = Qnil;
+  switch (status)
+    {
+    case UNAuthorizationStatusNotDetermined:
+      return Qnot_determined;
+    case UNAuthorizationStatusDenied:
+      return Qdenied;
+    case UNAuthorizationStatusAuthorized:
+      return Qauthorized;
+    case UNAuthorizationStatusProvisional:
+      return Qprovisional;
+    default:
+      return Qnil;
+    }
+}
+
+Lisp_Object
+mac_notification_send(Lisp_Object title,
+                      Lisp_Object message,
+                      Lisp_Object arg_plist)
+{
+  Lisp_Object n_id = Fplist_get(arg_plist, QCreplaces_id);
+  NSString *identifier;
+
+  /*
+   * Create the notification content, validating input while running
+   * in the lisp thread.
+   */
+  if (!NILP(n_id))
+    {
+      /* XXX See if we have one with this ID and remvoe it */
+      identifier = [NSString stringWithUTF8LispString:n_id];
+    }
+  else
+    {
+      EmacsController *emacsController = (EmacsController *)[NSApp delegate];
+      /* Get a unique identifier */
+      do {
+        identifier = [NSString stringWithString:[NSUUID UUID].UUIDString];
+      } while ([emacsController->notificationIdentifiers objectForKey:identifier]);
+    }
+
+  UNMutableNotificationContent* content = [[UNMutableNotificationContent alloc] init];
+  content.title = [NSString stringWithUTF8LispString:title];
+  content.body =  [NSString stringWithUTF8LispString:message];
+
+  Lisp_Object category = Fplist_get (arg_plist, QCcategory);
+  if (NILP(category))
+    content.categoryIdentifier = @"Generic";
+  else
+    {
+      CHECK_STRING(category);
+      content.categoryIdentifier = [NSString stringWithUTF8LispString:category];
+    }
+
+  Lisp_Object subtitle = Fplist_get (arg_plist, QCsubtitle);
+  if (!NILP(subtitle))
+    {
+      CHECK_STRING(category);
+      content.subtitle = [NSString stringWithUTF8LispString:subtitle];
+    }
+
+  Lisp_Object sound_name = Fplist_get (arg_plist, QCsound_name);
+  if (NILP(sound_name))
+    content.sound = [UNNotificationSound defaultSound];
+  else
+    {
+      CHECK_STRING(sound_name);
+      content.sound = [UNNotificationSound soundNamed:[NSString stringWithUTF8LispString:sound_name]];
+    }
+
+  /*
+   * Add user callbacks
+   */
+  NSMutableDictionary *options = [NSMutableDictionary dictionary];
+  Lisp_Object on_action = Fplist_get (arg_plist, QCon_action);
+
+  /*
+   * If the callback has a symbol name then store that as we might be
+   * able to use it if emacs restarts, where a lambda we cannot.
+   */
+  if (!NILP(on_action))
+    {
+      if (Fsymbolp(on_action))
+        {
+          Lisp_Object sym_name = Fsymbol_name(on_action);
+          CHECK_TYPE (Ffboundp(on_action) == Qt, Qfboundp, on_action);
+          [options setObject:[NSString stringWithUTF8LispString:sym_name]
+                      forKey:@"on-action-symbol"];
+        }
+      else
+        {
+          CHECK_TYPE (FUNCTIONP(on_action), Qfboundp, on_action);
+          [options setObject:mac_objptr_as_data(on_action)
+                      forKey:@"on-action-closure"];
+        }
+    }
+
+  Lisp_Object on_close = Fplist_get (arg_plist, QCon_close);
+  if (!NILP(on_close))
+    {
+      if (Fsymbolp(on_close))
+        {
+          Lisp_Object sym_name = Fsymbol_name(on_close);
+          CHECK_TYPE (Ffboundp(on_close) == Qt, Qfboundp, on_close);
+          [options setObject:[NSString stringWithUTF8LispString:sym_name]
+                      forKey:@"on-close-symbol"];
+        }
+      else
+        {
+          CHECK_TYPE (FUNCTIONP(on_close), Qfboundp, on_close);
+          [options setObject:mac_objptr_as_data(on_close)
+                      forKey:@"on-close-closure"];
+        }
+    }
+  content.userInfo = options;
+
+  /*
+   * Create the request
+   */
+  UNNotificationRequest* request =
+    [UNNotificationRequest requestWithIdentifier:identifier
+                                         content:content
+                                         trigger:nil];
+
+  if (!NILP(Vdebug_mac_notifications))
+    NSLog(@"[!] Checking for permission and adding new notifcation request: %@", request);
+
+  /*
+   * Schedule the notification
+   */
+  UNUserNotificationCenter* center = [UNUserNotificationCenter currentNotificationCenter];
+  [center getNotificationSettingsWithCompletionHandler:^(UNNotificationSettings *settings){
+      [center addNotificationRequest:request
+               withCompletionHandler:^(NSError *error){
+          if (error)
+            NSLog(@"[!] Error attempting to post notification: %@ (%@)", error, request);
+        }];
+    }];
+
+  /* Store this identifier in our dictionary */
+  [emacsController->notificationIdentifiers setObject:[NSNumber numberWithBool:YES]
+                                               forKey:identifier];
+
+  return [identifier UTF8LispString];
+}
+
+- (void)userNotificationCenter:(UNUserNotificationCenter *)center
+       willPresentNotification:(UNNotification *)notification
+         withCompletionHandler:(void (^)(UNNotificationPresentationOptions options))completionHandler;
+{
+
+#if 0 // Banner shows up in 11.0 for 10.14+ compat use Alert
+  completionHandler(UNNotificationPresentationOptionBanner+
+                    UNNotificationPresentationOptionSound);
+#else
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+  completionHandler(UNNotificationPresentationOptionAlert+
+                    UNNotificationPresentationOptionSound);
+#pragma clang diagnostic pop
+#endif
+}
+
+
+- (void)userNotificationCenter:(UNUserNotificationCenter *)center
+didReceiveNotificationResponse:(UNNotificationResponse *)response
+         withCompletionHandler:(void (^)(void))completionHandler;
+{
+  if ([response.actionIdentifier isEqualToString:UNNotificationDefaultActionIdentifier])
+    mac_notification_clicked(response, NO, @"default");
+  else if ([response.actionIdentifier isEqualToString:UNNotificationDismissActionIdentifier])
+    mac_notification_clicked(response, YES, nil);
+  else
+    mac_notification_clicked(response, NO, response.actionIdentifier);
+  completionHandler();
+}
+
+#endif /* HAVE_OSX_USER_NOTIFICATIONS */
+
+#ifdef HAVE_OSX_FOUNDATION_NOTIFICATIONS
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+
+static void
+mac_legacy_notification_clicked(NSUserNotification *legacyNotification,
+                                BOOL is_dismiss,
+                                NSString *key)
+{
+  _mac_notification_clicked(legacyNotification.identifier,
+                            legacyNotification.userInfo,
+                            is_dismiss, key);
+}
+
+Lisp_Object
+mac_legacy_notification_get_delivered (void)
+{
+  NSUserNotificationCenter *center =
+    [NSUserNotificationCenter defaultUserNotificationCenter];
+  NSArray<NSUserNotification *> *na = [center deliveredNotifications];
+  Lisp_Object result = Qnil;
+
+  for (int i = na.count - 1; i >= 0; i--)
+    result = Fcons([na[i].identifier UTF8LispString], result);
+
+  return result;
+}
+
+Lisp_Object
+mac_legacy_notification_send(Lisp_Object title,
+                             Lisp_Object message,
+                             Lisp_Object arg_plist)
+{
+  Lisp_Object n_id = Fplist_get(arg_plist, QCreplaces_id);
+  NSString *identifier;
+  if (!NILP(n_id))
+    identifier = [NSString stringWithUTF8LispString:n_id];
+  else
+    identifier = [NSString stringWithString:[NSUUID UUID].UUIDString];
+
+  NSUserNotification *userNotification = [NSUserNotification new];
+  userNotification.title = [NSString stringWithUTF8LispString:title];
+  userNotification.informativeText = [NSString stringWithUTF8LispString:message];
+
+  userNotification.identifier = identifier;
+
+  Lisp_Object rv = [identifier UTF8LispString];
+  /*
+   * We indicate no close button so a "Show" button isn't
+   * displayed. The standard dbus based notification doesn't have a
+   * good analogy to clicking on the notification vs a button.
+   */
+  userNotification.hasActionButton = NO;
+  // userNotification.actionButtonTitle = @"PushMe";
+  // userNotification.otherButtonTitle = @"Ignore";
+
+  Lisp_Object sound_name = Fplist_get (arg_plist, QCsound_name);
+  if (STRINGP(sound_name))
+    userNotification.soundName = [NSString stringWithUTF8LispString:sound_name];
+
+  /*
+   * Add user callbacks
+   */
+  NSMutableDictionary *options = [NSMutableDictionary dictionary];
+  Lisp_Object callback;
+  callback = Fplist_get (arg_plist, QCon_action);
+  if (!NILP(callback))
+    [options setObject:mac_objptr_as_data(callback)
+                forKey:@"on-action"];
+  callback = Fplist_get (arg_plist, QCon_close);
+  if (!NILP(callback))
+    [options setObject:mac_objptr_as_data(callback)
+                forKey:@"on-close"];
+  userNotification.userInfo = options;
+
+  /*
+   * Add user actions.
+   */
+  NSMutableArray<NSUserNotificationAction *> *actions =
+    [NSMutableArray<NSUserNotificationAction *> new];
+  Lisp_Object action_list = Fplist_get (arg_plist, QCactions);
+  CHECK_LIST(action_list);
+  for (; !NILP(action_list) && !NILP(XCDR(action_list));
+       action_list = XCDR(XCDR(action_list)))
+    {
+      Lisp_Object a_key = XCAR(action_list);
+      Lisp_Object a_title = XCAR(XCDR(action_list));
+      NSUserNotificationAction *action =
+        [NSUserNotificationAction actionWithIdentifier:[NSString stringWithUTF8LispString:a_key]
+                                                 title:[NSString stringWithUTF8LispString:a_title]];
+      [actions addObject:action];
+    }
+  CHECK_LIST_END (action_list, action_list);
+  if (!actions.count)
+    actions = nil;
+  userNotification.additionalActions = actions;
+
+  /*
+   * Post it
+   */
+  NSUserNotificationCenter *center = [NSUserNotificationCenter defaultUserNotificationCenter];
+  EmacsController *emacsController = (EmacsController *)[NSApp delegate];
+  center.delegate = emacsController;
+  [center scheduleNotification:userNotification];
+  return rv;
+
+}
+
+- (BOOL)userNotificationCenter:(NSUserNotificationCenter *)center
+     shouldPresentNotification:(NSUserNotification *)userNotification;
+{
+  return YES;
+}
+
+// Once the notification is delivered we can exit.
+- (void)userNotificationCenter:(NSUserNotificationCenter *)center
+        didDeliverNotification:(NSUserNotification *)userNotification;
+{
+  return;
+}
+
+- (void)userNotificationCenter:(NSUserNotificationCenter *)center
+       didActivateNotification:(NSUserNotification *)userNotification;
+{
+  switch (userNotification.activationType)
+    {
+    case NSUserNotificationActivationTypeNone:
+      break;
+    case NSUserNotificationActivationTypeReplied:
+      break;
+    case NSUserNotificationActivationTypeContentsClicked:
+      /* XXX we need to close this ourselves */
+      mac_legacy_notification_clicked(userNotification, NO, @"default");
+      break;
+    case NSUserNotificationActivationTypeActionButtonClicked:
+      mac_legacy_notification_clicked(userNotification, NO, @"default");
+      break;
+    case NSUserNotificationActivationTypeAdditionalActionClicked:
+      mac_legacy_notification_clicked(userNotification, NO,
+                                      [userNotification additionalActivationAction].identifier);
+      break;
+    }
+}
+
+#pragma clang diagnostic pop
+#endif /* HAVE_OSX_FOUNDATION_NOTIFICATIONS */
+
 @end				// EmacsController
+
 
 OSStatus
 install_application_handler (void)
