@@ -354,7 +354,16 @@ HAVE_PDUMPER = @HAVE_PDUMPER@
 
 ## ARM Macs require that all code have a valid signature.  Since pdump
 ## invalidates the signature, we must re-sign to fix it.
-DO_CODESIGN=$(patsubst aarch64-apple-darwin%,yes,@configuration@)
+_DO_CODESIGN=$(patsubst aarch64-apple-darwin%,yes,@configuration@)
+DO_CODESIGN=$(patsubst arm-apple-darwin%,yes,$(_DO_CODESIGN))
+
+# # 'make' verbosity.
+# AM_DEFAULT_VERBOSITY = @AM_DEFAULT_VERBOSITY@
+
+# AM_V_CC = $(am__v_CC_@AM_V@)
+# am__v_CC_ = $(am__v_CC_@AM_DEFAULT_V@)
+# am__v_CC_0 = @echo "  CC      " $@;
+# am__v_CC_1 =
 
 -include ${top_builddir}/src/verbose.mk
 
