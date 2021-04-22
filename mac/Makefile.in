@@ -28,6 +28,17 @@ DUMPING = @DUMPING@
 
 MKDIR_P = @MKDIR_P@
 
+## ARM Macs require that all code have a valid signature.  Since pump
+## invalidates the signature, we must re-sign to fix it.
+_DO_CODESIGN=$(patsubst aarch64-apple-darwin%,yes,@configuration@)
+DO_CODESIGN=$(patsubst arm-apple-darwin%,yes,$(_DO_CODESIGN))
+
+ifeq ($(DO_CODESIGN),yes)
+signing_file := Emacs.app/Contents/_CodeSignature/CodeResources
+else
+signing_file :=
+endif
+
 ifeq ($(DUMPING),pdumper)
 bundle_pdmp := Emacs.app/Contents/MacOS/Emacs.pdmp
 else
@@ -83,6 +94,7 @@ ifneq ($(CURDIR), $(realpath ${srcdir}))
 Emacs.app/Contents/MacOS/Emacs.sh: ${srcdir}/Emacs.app/Contents/MacOS/Emacs.sh
 	${MKDIR_P} Emacs.app/Contents/MacOS
 	cp $< $@
+
 Emacs.app/Contents/PkgInfo: ${srcdir}/Emacs.app/Contents/PkgInfo
 	cp $< $@
 Emacs.app/Contents/Resources/Emacs.icns: ${srcdir}/Emacs.app/Contents/Resources/Emacs.icns
@@ -96,14 +108,26 @@ endif
 macosx-bundle: ${lprojdirs} Emacs.app/Contents/MacOS/Emacs.sh \
 	Emacs.app/Contents/PkgInfo Emacs.app/Contents/Resources/Emacs.icns \
 	Emacs.app/Contents/Resources/document.icns
-macosx-app: macosx-bundle Emacs.app/Contents/MacOS/Emacs $(bundle_pdmp)
+macosx-app-nosign: macosx-bundle Emacs.app/Contents/MacOS/Emacs $(bundle_pdmp)
+macosx-app: macosx-app-nosign $(signing_file)
 Emacs.app/Contents/MacOS/Emacs: ../src/emacs${EXEEXT}
 	${MKDIR_P} Emacs.app/Contents/MacOS
 	rm -f $@
 	cp $< $@
+
 Emacs.app/Contents/MacOS/Emacs.pdmp: ../src/emacs${EXEEXT}.pdmp
 	${MKDIR_P} Emacs.app/Contents/MacOS
 	cp $< $@
+
+# If we are signing we need to sign all the executable as well as the
+# application overall.
+$(signing_file): macosx-app-nosign
+ifeq ($(DUMPING),pdumper)
+	codesign -s - -f Emacs.app/Contents/MacOS/Emacs.pdmp
+endif
+	codesign -s - -f Emacs.app/Contents/MacOS/Emacs.sh
+	codesign -s - -f Emacs.app/Contents/MacOS/Emacs
+	codesign -s - -f Emacs.app
 
 .PHONY: all
 
