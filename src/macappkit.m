@@ -2581,8 +2581,13 @@ mac_notification_send(Lisp_Object title,
          withCompletionHandler:(void (^)(UNNotificationPresentationOptions options))completionHandler;
 {
 
+#if 0 // Banner shows up in 11.0 for 10.14+ compat use Alert
   completionHandler(UNNotificationPresentationOptionBanner+
                     UNNotificationPresentationOptionSound);
+#else
+  completionHandler(UNNotificationPresentationOptionAlert+
+                    UNNotificationPresentationOptionSound);
+#endif
 }
 
 
