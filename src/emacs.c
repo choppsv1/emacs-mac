@@ -1961,6 +1961,7 @@ Using an Emacs configured with --with-x-toolkit=lucid does not have this problem
 
 #ifdef HAVE_MACGUI
       syms_of_mac ();
+      syms_of_macappkit ();
       syms_of_macterm ();
       syms_of_macfns ();
       syms_of_macmenu ();

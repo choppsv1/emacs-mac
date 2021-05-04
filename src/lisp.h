@@ -4753,6 +4753,7 @@ extern void mac_release_autorelease_pool (void *);
 #endif
 
 /* Defined in macappkit.m */
+extern void syms_of_macappkit (void);
 extern bool mac_gui_thread_p (void);
 extern void mac_handle_alarm_signal (void);
 
