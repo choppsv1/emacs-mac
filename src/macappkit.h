@@ -31,6 +31,10 @@ along with GNU Emacs Mac port.  If not, see <https://www.gnu.org/licenses/>.  */
 #endif
 #define Z (current_buffer->text->z)
 
+#ifdef HAVE_OSX_USER_NOTIFICATIONS
+#import <UserNotifications/UserNotifications.h>
+#endif
+
 #ifndef NSFoundationVersionNumber10_8_3
 #define NSFoundationVersionNumber10_8_3 945.16
 #endif
@@ -773,7 +777,11 @@ typedef NSInteger NSGlyphProperty;
    dialogs, and actions/services bound in the mac-apple-event
    keymap.  */
 
-@interface EmacsController : NSObject <NSApplicationDelegate, NSUserInterfaceValidations>
+@interface EmacsController : NSObject <NSApplicationDelegate, NSUserInterfaceValidations
+#ifdef HAVE_OSX_USER_NOTIFICATIONS
+    , UNUserNotificationCenterDelegate
+#endif
+    >
 {
   /* Points to HOLD_QUIT arg passed to read_socket_hook.  */
   struct input_event *hold_quit;
@@ -838,6 +846,12 @@ typedef NSInteger NSGlyphProperty;
   /* Set of key paths for which NSApp is observed via the
      `application-kvo' subkeymap in mac-apple-event-map.  */
   NSSetOf (NSString *) *observedKeyPaths;
+
+#ifdef HAVE_OSX_USER_NOTIFICATIONS
+  /* Set of out notification categories */
+  NSMutableSet<UNNotificationCategory *> *notificationCategories;
+  NSMutableDictionaryOf(NSString *, NSNumber *) *notificationIdentifiers;
+#endif
 }
 - (void)updateObservedKeyPaths;
 - (int)getAndClearMenuItemSelection;
