@@ -163,6 +163,7 @@ static void mac_within_gui_and_here (void (^ CF_NOESCAPE) (void),
 				     void (^ CF_NOESCAPE) (void));
 static void mac_within_gui_allowing_inner_lisp (void (^ CF_NOESCAPE) (void));
 static void mac_within_lisp (void (^ CF_NOESCAPE) (void));
+static void mac_within_lisp_deferred (void (^block) (void));
 static void mac_within_lisp_deferred_unless_popup (void (^) (void));
 
 @implementation NSData (Emacs)
@@ -1301,6 +1302,14 @@ static void mac_update_accessibility_display_options (void);
 
 static EventRef mac_peek_next_event (void);
 
+#ifdef HAVE_OSX_USER_NOTIFICATIONS
+/* Set of out notification categories */
+static void mac_init_notifications (void);
+NSMutableSet<UNNotificationCategory *> *notificationCategories;
+NSMutableDictionaryOf(NSString *, NSNumber *) *notificationIdentifiers;
+int notificationsInit = 0;
+#endif
+
 /* True if we are executing handleQueuedNSEventsWithHoldingQuitIn:.  */
 static bool handling_queued_nsevents_p;
 
@@ -2178,7 +2187,524 @@ emacs_windows_need_display_p (void)
     }
 }
 
+#ifdef HAVE_OSX_USER_NOTIFICATIONS
+
+/*
+ * Notifications
+ */
+
+NSData *
+mac_objptr_as_data(Lisp_Object object)
+{
+    void *vdata = lisp_h_XLP(object);
+    return [NSData dataWithBytes:&vdata
+                          length:sizeof(vdata)];
+}
+
+Lisp_Object
+mac_callable_from_data(NSData *data)
+{
+    void *vcallback;
+    if (!data)
+        return Qnil;
+    [data getBytes:&vcallback
+            length:sizeof(vcallback)];
+    return lisp_h_XPL(vcallback);
+}
+
+Lisp_Object
+mac_callable_from_sym_name(NSString *sym_name)
+{
+  if (!sym_name)
+    return Qnil;
+
+  Lisp_Object symbol = Fintern([sym_name UTF8LispString], Qnil);
+  if (Ffboundp(symbol) == Qnil)
+    return Qnil;
+
+  return symbol;
+}
+
+/*
+  (mac-notification-send "title" "this is a message"
+  :on-close (lambda (what) (message "on-close: %s" what))
+  :on-action  (lambda (what) (message "on-action: %s" what))
+  :actions '("A1" "ATitle" "B1" "BTitle")
+  :sound-name "Woosh")
+
+  (mac-notification-add-category "Testing" '("A1" "ATitle" "B1" "BTitle"))
+  (mac-notification-send "title" "this is a message"
+  :category "Testing"
+  :on-close (lambda (what) (message "on-close: %s" what))
+  :on-action  (lambda (what) (message "on-action: %s" what))
+  :sound-name "Looking Up")
+
+  (mac-delivered-notification)
+*/
+
+static Lisp_Object
+mac_notification_clicked_lisp_error(enum nonlocal_exit nle, Lisp_Object o)
+{
+  /* The user should hear about it */
+  Lisp_Object s = CALLN(Fformat, build_string("mac_notification_clicked_lisp_error: %s"), o);
+  if (!NILP(Vdebug_mac_notifications))
+    NSLog(@"%@: %@", @(__func__), [NSString stringWithUTF8LispString:s]);
+  message3(s);
+  return s;
+}
+
+struct _click_args {
+  UNNotificationResponse *response;
+  Lisp_Object lkey, close_reason;
+};
+
+static Lisp_Object
+mac_notification_clicked_lisp(void *arg)
+{
+
+  struct _click_args *args = (struct _click_args *)arg;
+
+  UNNotificationResponse *response = CFBridgingRelease(args->response);
+  UNNotificationContent *content = response.notification.request.content;
+  NSDictionary *options = response.notification.request.content.userInfo;
+  NSString *identifier = response.notification.request.identifier;
+
+  Lisp_Object cb = Fintern(build_string("mac-notification-receive"), Qnil);
+  if (Ffboundp(cb) == Qnil)
+      return Qt;
+
+  Lisp_Object plist = Fplist_put(Qnil, intern(":identifier"), [identifier UTF8LispString]);
+  if (content.categoryIdentifier)
+    plist = Fplist_put(plist, intern(":category"), [content.categoryIdentifier UTF8LispString]);
+  // if (content.threadIdentifier)
+  //   plist = Fplist_put(plist, intern(":thread"), [content.threadIdentifier UTF8LispString]);
+  if (content.targetContentIdentifier)
+    plist = Fplist_put(plist, intern(":target-content"), [content.targetContentIdentifier UTF8LispString]);
+  if (content.title)
+    plist = Fplist_put(plist, intern(":title"), [content.title UTF8LispString]);
+  if (content.subtitle)
+    plist = Fplist_put(plist, intern(":subtitle"), [content.subtitle UTF8LispString]);
+  if (content.body)
+    plist = Fplist_put(plist, intern(":body"), [content.body UTF8LispString]);
+  if (content.badge)
+    plist = Fplist_put(plist, intern(":badge"), make_int([content.badge intValue]));
+
+  if ([response respondsToSelector:@selector(userText)] && [(id)response userText].length)
+      plist = Fplist_put(plist, intern(":user-text"), [[(id)response userText] UTF8LispString]);
+
+  /* Add the user data into the plist */
+  for (NSString *key in options)
+    plist = Fplist_put(plist, Fintern([key UTF8LispString], Qnil), [options[key] UTF8LispString]);
+
+  call3(cb, args->lkey, args->close_reason, plist);
+  return Qt;
+}
+
+static void
+mac_notification_clicked(UNNotificationResponse *response,
+                         BOOL is_dismiss,
+                         NSString *key)
+{
+  NSString *identifier = response.notification.request.identifier;
+
+  MRC_RETAIN(key);
+  MRC_RETAIN(identifier);
+
+  if (!mac_gui_thread_p ())
+    NSLog(@"[!] XXX UNEXPECTED NOT IN GUI THREAD");
+
+  if (!NILP(Vdebug_mac_notifications))
+      NSLog(@"[!] Notification has been acted on");
+
+  mac_within_lisp_deferred (^{
+      if (mac_gui_thread_p ())
+        NSLog(@"[!] XXX UNEXPECTED IN GUI THREAD");
+
+      Lisp_Object lkey = key ? [key UTF8LispString] : Qnil;
+      Lisp_Object close_reason = is_dismiss ? Qdismissed : Qclose_notification;
+
+      BOOL is_old = ![notificationIdentifiers objectForKey:identifier];
+
+      struct _click_args args = {
+        (void*)CFBridgingRetain(response), lkey, close_reason,
+      };
+
+      /* XXX if the user requests input during callback we hang */
+      int owfi = waiting_for_input;
+      waiting_for_input = 0;
+      (void)internal_catch_all (mac_notification_clicked_lisp,
+                                &args,
+                                mac_notification_clicked_lisp_error);
+      waiting_for_input = owfi;
+
+      if (!is_old)
+        [notificationIdentifiers removeObjectForKey:identifier];
+
+      MRC_RELEASE(key);
+      MRC_RELEASE(identifier);
+    });
+}
+
+DEFUN ("mac-notification-os-add-category", Fmac_notification_os_add_category,
+       Smac_notification_os_add_category,
+       2, 2, 0,
+       doc: /* Add a category of notifications with their actions
+
+A predefined "generic" category exists which has no actions.
+
+ACTIONS has the form '((\"KEY\" [\"TITLE\" [OPTIONS]]) ...)
+
+KEY is used for TITLE if TITLE is not given.
+
+OPTIONS specify options for the action which can be any number
+of the following atoms:
+
+`authentication-required' - action can only be taken on unlocked
+device.
+
+`destructive' - the action will perform some destructive
+action (and is displayed differently).
+
+`foreground' - the action should cause Emacs to launch into the
+foreground.
+
+usage: (mac-notification-os-add-category CATEGORY ACTIONS)  */)
+  (Lisp_Object category_name, Lisp_Object action_list)
+{
+  CHECK_STRING(category_name);
+  NSString *cat_name = [NSString stringWithUTF8LispString:category_name];
+  UNNotificationCategory *category;
+
+  if (inhibit_window_system)
+    return Qnil;
+  if (!notificationsInit)
+      mac_init_notifications ();
+
+  /* First see if a category already exists in the set with the give name */
+  for (category in notificationCategories)
+    {
+      if ([category.identifier isEqualToString:cat_name])
+        {
+          [notificationCategories removeObject:category];
+          break;
+        }
+    }
+
+  NSMutableArray<UNNotificationAction *> *actions = [NSMutableArray<UNNotificationAction *> new];
+
+  CHECK_LIST(action_list);
+  for (; !NILP(action_list); action_list = CDR_SAFE(action_list))
+    {
+      Lisp_Object aspec = CAR(action_list);
+      Lisp_Object a_key = Qnil;
+      Lisp_Object a_title = Qnil;
+      NSString *input_button = nil;
+      NSString *input_placeholder = nil;
+      uint16_t oflags = 0;
+      if (Fstringp(aspec))
+        a_key = a_title = aspec;
+      else
+        {
+          a_key = CAR(aspec);
+          CHECK_STRING(a_key);
+          aspec = CDR_SAFE(aspec);
+          a_title = CAR_SAFE(aspec);
+          if (NILP(a_title))
+            a_title = a_key;
+          else
+            {
+              for (aspec = CDR_SAFE(aspec); !NILP(aspec); aspec = CDR_SAFE(aspec))
+                {
+                  Lisp_Object opt = CAR(aspec);
+                  if (NILP(opt))
+                      break;
+                  if (Fsymbolp(opt))
+                      opt = Fsymbol_name(opt);
+                  CHECK_STRING(opt);
+                  NSString *optname = [NSString stringWithUTF8LispString:opt];
+
+                  if ([optname isEqualToString:@":text-input-button"])
+                    {
+                      aspec = CDR_SAFE(aspec);
+                      Lisp_Object v = CAR_SAFE(aspec);
+                      CHECK_STRING(v);
+                      input_button = [NSString stringWithUTF8LispString:v];
+                      NSLog(@"Got text input button: %@", input_button);
+                    }
+                  else if ([optname isEqualToString:@":text-input-placeholder"])
+                    {
+                      aspec = CDR_SAFE(aspec);
+                      Lisp_Object v = CAR_SAFE(aspec);
+                      CHECK_STRING(v);
+                      input_placeholder = [NSString stringWithUTF8LispString:v];
+                      NSLog(@"Got text input placeholder: %@", input_placeholder);
+                    }
+                  else
+                    {
+                      NSNumber *num = @{
+                        @"authentication-required": @(UNNotificationActionOptionAuthenticationRequired),
+                        @"destructive": @(UNNotificationActionOptionDestructive),
+                        @"foreground": @(UNNotificationActionOptionForeground),
+                      }[optname];
+                      if (!num)
+                    num = @([optname intValue]);
+                      if (!num)
+                        {
+                          NSLog(@"%@: bad option value: %@", @(__func__), optname);
+                          CALLN(Fmessage, build_string("%s: bad option value: %s"), build_string(__func__), opt);
+                        }
+                      else
+                        oflags |= [num unsignedShortValue];
+                    }
+                }
+            }
+        }
+      CHECK_STRING(a_key);
+      CHECK_STRING(a_title);
+      UNNotificationAction *action;
+      if (input_button || input_placeholder)
+        action = [UNTextInputNotificationAction
+                         actionWithIdentifier:[NSString stringWithUTF8LispString:a_key]
+                                        title:[NSString stringWithUTF8LispString:a_title]
+                                      options:oflags
+                         textInputButtonTitle:input_button ? input_button : @""
+                         textInputPlaceholder:input_placeholder ? input_placeholder : @""];
+      else
+        action = [UNNotificationAction
+                       actionWithIdentifier:[NSString stringWithUTF8LispString:a_key]
+                                      title:[NSString stringWithUTF8LispString:a_title]
+                                    options:oflags];
+      [actions addObject:action];
+    }
+  CHECK_LIST_END (action_list, action_list);
+
+  category = [UNNotificationCategory
+               categoryWithIdentifier:cat_name
+                              actions:actions
+                    intentIdentifiers:@[]
+                              options:UNNotificationCategoryOptionCustomDismissAction];
+
+  if (!NILP(Vdebug_mac_notifications))
+    NSLog(@"[!] Adding new category: %@", category);
+
+  [notificationCategories addObject:category];
+
+  if (!NILP(Vdebug_mac_notifications))
+    NSLog(@"[!] Setting new categories: %@", notificationCategories);
+
+  UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
+  [center setNotificationCategories:notificationCategories];
+
+  return Qt;
+}
+
+DEFUN ("mac-notification-os-send", Fmac_notification_os_send, Smac_notification_os_send,
+       2, MANY, 0,
+       doc: /* Post a notification with the given TITLE and BODY.
+
+Additional parameters for the notification given in PARAMS. An
+IDENTIFIER uniquely representing this notification is returned. All
+properties not recognized, which have either symbolp or stringp values
+will be returned in the content plist to the action callback routine.
+
+One predefined category exists, "generic" with the following
+properties:
+
+"generic"  -- Displays the notification with no action buttons. Emacs
+              will be activated/launched.
+
+The following additional parameters are supported:
+
+:badge NUMBER       -- 0 to clear otherwise set badge to this number
+:category CATEGORY  -- category which specified the actions that will
+                       be associated with this notification. Either
+                       one of the predefined categories (default is
+                       "generic") or ones defined by
+                       `mac-notification-add-category`.
+:sound-name SOUND-NAME -- Play the system sound identified by SOUND-NAME.
+:subtitle SUBTITLE     -- Display the given SUBTITLE under the TITLE.
+:target-content STRING -- Returned to help identify the notification.
+:thread-identifier STRING -- A value to group notifications under.
+
+When the user responds to the notification, and if a function is bound to
+the symbol `mac-notification-receive', that function is called with 3
+arguments: ACTION CLOSE-REASON and CONTENT. ACTION is the Key value
+for the action as defined by the CATEGORY. CLOSE-REASON indicates how
+the notification was closed and can be one of:
+
+'close-notification -- The notification was closed normally indicating
+                       that Emacs should act on it.
+'dismissed          -- The notification was dismissed indicating
+                       that Emacs should not act upon it.
+'expired            -- The notification expired.
+'undefined          -- unknown, treat as dismissed.
+
+CONTENT is a plist which contains most of the values defined in
+UNNotificationContent (e.g., the title can be found in :title if
+non-nil). Additionally :identifier is set the the identifier for this
+notification, :category is the category that defined the actions. All
+values are strings except :badge which is a number.
+Any unrecognized
+properties passed in PARAMS whose values are either symbolp or stringp
+will also be returned in CONTENT (as strings). Below is a list of the
+properties that may be present:
+
+':badge'       -- as passed in
+':body'        -- as passed in
+':category'    -- as passed in
+':identifier'  -- as returned on creation of notification
+':subtitle'    -- as passed in
+':title'       -- as passed in
+':target-content'    -- as passed in (seems to go missing)
+':thread-identifier' -- as passed in (seems to go missing)
+':user-text'         -- if category defines text input option from the
+                        user and it was given, this is that value.
+
+usage: (mac-notification-os-send TITLE BODY &rest PARAMS)  */)
+  (ptrdiff_t nargs, Lisp_Object *args)
+{
+  Lisp_Object title = args[0];
+  Lisp_Object message = args[1];
+  Lisp_Object arg_plist = Flist(nargs - 2, args + 2);
+  char *c_title, *c_message;
+
+  assert(nargs >= 2);
+  CHECK_STRING(title);
+  CHECK_STRING(message);
+
+  if (inhibit_window_system)
+    return Qnil;
+  if (!notificationsInit)
+      mac_init_notifications ();
+
+  /*
+   * Create the notification content, validating input while running
+   * in the lisp thread.
+   */
+  NSString *identifier;
+  do {
+    identifier = [NSString stringWithString:[NSUUID UUID].UUIDString];
+  } while ([notificationIdentifiers objectForKey:identifier]);
+
+  UNMutableNotificationContent* content = [[UNMutableNotificationContent alloc] init];
+  content.title = [NSString stringWithUTF8LispString:title];
+  content.body =  [NSString stringWithUTF8LispString:message];
+
+  NSMutableDictionary *options = [NSMutableDictionary dictionary];
+
+  content.categoryIdentifier = @"Generic";
+
+  /* Get our properties, add any unknowns to user info */
+  Lisp_Object tail = arg_plist;
+  FOR_EACH_TAIL_SAFE (tail)
+    {
+      if (!CONSP(XCDR(tail)))
+        break;
+
+      Lisp_Object property = XCAR(tail);
+      Lisp_Object value = XCAR (XCDR(tail));
+      tail = XCDR (tail);
+
+      if (!SYMBOLP(property))
+        continue;
+
+      if (EQ (QCbadge, property))
+        {
+          content.badge = [NSNumber numberWithInt:XFIXNUM(value)];
+          continue;
+        }
+
+      /* Get the value as a string or continue */
+      if (SYMBOLP(value))
+        value = Fsymbol_name(value);
+      if (!STRINGP(value))
+        continue;
+
+      NSString *ns_value = [NSString stringWithUTF8LispString:value];
+      if (EQ (QCcategory, property))
+        content.categoryIdentifier = ns_value;
+      else if (EQ (QCsound_name, property))
+        content.sound = [UNNotificationSound soundNamed:ns_value];
+      else if (EQ (QCsubtitle, property))
+        content.subtitle = ns_value;
+      else if (EQ (QCtarget_content, property))
+        content.targetContentIdentifier = ns_value;
+      else if (EQ (QCthread_identifier, property))
+        content.threadIdentifier = ns_value;
+      else
+        [options setObject:ns_value
+                    forKey:[NSString stringWithUTF8LispString:Fsymbol_name(property)]];
+    }
+  content.userInfo = options;
+
+  if (!content.sound)
+    content.sound = [UNNotificationSound defaultSound];
+
+  /*
+   * Create the request
+   */
+  UNNotificationRequest* request =
+    [UNNotificationRequest requestWithIdentifier:identifier
+                                         content:content
+                                         trigger:nil];
+
+  if (!NILP(Vdebug_mac_notifications))
+    NSLog(@"[!] Checking for permission and adding new notifcation request: %@", request);
+
+  /*
+   * Schedule the notification
+   */
+  UNUserNotificationCenter* center = [UNUserNotificationCenter currentNotificationCenter];
+  [center getNotificationSettingsWithCompletionHandler:^(UNNotificationSettings *settings){
+      [center addNotificationRequest:request
+               withCompletionHandler:^(NSError *error){
+          if (error)
+            NSLog(@"[!] Error attempting to post notification: %@ (%@)", error, request);
+        }];
+    }];
+
+  /* Store this identifier in our dictionary */
+  [notificationIdentifiers setObject:[NSNumber numberWithBool:YES]
+                              forKey:identifier];
+
+  return [identifier UTF8LispString];
+}
+
+- (void)userNotificationCenter:(UNUserNotificationCenter *)center
+       willPresentNotification:(UNNotification *)notification
+         withCompletionHandler:(void (^)(UNNotificationPresentationOptions options))completionHandler;
+{
+
+#if 0 // Banner shows up in 11.0 for 10.14+ compat use Alert
+  completionHandler(UNNotificationPresentationOptionBanner+
+                    UNNotificationPresentationOptionSound);
+#else
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+  completionHandler(UNNotificationPresentationOptionAlert+
+                    UNNotificationPresentationOptionSound);
+#pragma clang diagnostic pop
+#endif
+}
+
+
+- (void)userNotificationCenter:(UNUserNotificationCenter *)center
+didReceiveNotificationResponse:(UNNotificationResponse *)response
+         withCompletionHandler:(void (^)(void))completionHandler;
+{
+  if ([response.actionIdentifier isEqualToString:UNNotificationDefaultActionIdentifier])
+    mac_notification_clicked(response, NO, @"default");
+  else if ([response.actionIdentifier isEqualToString:UNNotificationDismissActionIdentifier])
+    mac_notification_clicked(response, YES, nil);
+  else
+    mac_notification_clicked(response, NO, response.actionIdentifier);
+  completionHandler();
+}
+
+#endif /* HAVE_OSX_USER_NOTIFICATIONS */
+
 @end				// EmacsController
+
 
 OSStatus
 install_application_handler (void)
@@ -17373,6 +17899,173 @@ mac_select (int nfds, fd_set *rfds, fd_set *wfds, fd_set *efds,
     }
 
   return r;
+}
+
+/***********************************************************************
+		           Notifications
+***********************************************************************/
+
+#ifdef HAVE_OSX_USER_NOTIFICATIONS
+
+static void
+mac_init_notifications (void)
+{
+  /*
+   * If we somehow registered as an application in CLI we wouldn't
+   * need this, we could support notifications from -nw, it works now
+   * but when the user clicks the notifcation it launches a GUI version.
+   */
+  if (inhibit_window_system)
+    return;
+  /*
+   * Register a predefined "generic" notification category
+   */
+  UNUserNotificationCenter* center = [UNUserNotificationCenter currentNotificationCenter];
+  center.delegate = emacsController;
+
+  UNNotificationCategory* genericCategory =
+    [UNNotificationCategory
+      categoryWithIdentifier:@"generic"
+                     actions:@[]
+           intentIdentifiers:@[]
+                     options:UNNotificationCategoryOptionCustomDismissAction];
+
+  notificationCategories = [NSMutableSet<UNNotificationCategory *> setWithObjects:genericCategory, nil];
+  MRC_RETAIN(notificationCategories);
+  [center setNotificationCategories:notificationCategories];
+
+  /*
+   * Create dictionary to store allocated identifiers
+   */
+  notificationIdentifiers = [[NSMutableDictionary alloc] init];
+  MRC_RETAIN(notificationIdentifiers);
+
+  /*
+   * Request permission to post notifications.
+   */
+  [center requestAuthorizationWithOptions:(UNAuthorizationOptionAlert + UNAuthorizationOptionSound)
+                        completionHandler:^(BOOL granted, NSError * _Nullable error){
+      if (!granted)
+        NSLog(@"[!] XXX No permissions to post notifications: %@", error);
+    }];
+
+  notificationsInit = 1;
+}
+
+DEFUN ("mac-notification-os-get-delivered", Fmac_notification_os_get_delivered,
+       Smac_notification_os_get_delivered, 0, 0, 0,
+       doc: /* Get a list of delivered notifications.
+
+usage: (mac-notification-get-delivered)  */)
+  (void)
+{
+  if (inhibit_window_system)
+    return Qnil;
+  if (!notificationsInit)
+    mac_init_notifications ();
+
+  UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
+  NSArray<UNNotification *> __block *na = nil;
+
+  if (!center)
+      return Qnil;
+
+  dispatch_semaphore_t sync = dispatch_semaphore_create(0);
+  [center getDeliveredNotificationsWithCompletionHandler:^(NSArray<UNNotification *> *notifications){
+      na = [notifications copy];
+      MRC_RETAIN(na);
+      dispatch_semaphore_signal(sync);
+    }];
+
+  dispatch_semaphore_wait(sync, DISPATCH_TIME_FOREVER);
+
+  if (!NILP(Vdebug_mac_notifications))
+    NSLog(@"[!] Got delivered notifications: %@", na);
+
+  Lisp_Object result = Qnil;
+  for (int i = na.count - 1; i >= 0; i--)
+    result = Fcons([na[i].request.identifier UTF8LispString], result);
+  MRC_RELEASE(na);
+  return result;
+}
+
+DEFUN ("mac-notification-os-get-settings", Fmac_notification_os_get_settings,
+       Smac_notification_os_get_settings, 0, 0, 0,
+       doc: /* Get a the settings (permissions) for notifications.
+
+usage: (mac-notification-get-settings)  */)
+  (void)
+{
+  if (inhibit_window_system)
+    return Qnot_determined;
+  if (!notificationsInit)
+    mac_init_notifications ();
+
+  UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
+  UNNotificationSettings __block *settings;
+
+  if (!center)
+      return Qnot_determined;
+
+  dispatch_semaphore_t sync = dispatch_semaphore_create(0);
+  [center getNotificationSettingsWithCompletionHandler:^(UNNotificationSettings *_settings){
+      settings = [_settings copy];
+      dispatch_semaphore_signal(sync);
+    }];
+  dispatch_semaphore_wait(sync, DISPATCH_TIME_FOREVER);
+
+  if (!NILP(Vdebug_mac_notifications))
+    NSLog(@"[!] Notifcations get settings: %@", settings);
+
+  UNAuthorizationStatus status = settings.authorizationStatus;
+  Lisp_Object result = Qnil;
+  switch (status)
+    {
+    case UNAuthorizationStatusNotDetermined:
+      return Qnot_determined;
+    case UNAuthorizationStatusDenied:
+      return Qdenied;
+    case UNAuthorizationStatusAuthorized:
+      return Qauthorized;
+    case UNAuthorizationStatusProvisional:
+      return Qprovisional;
+    default:
+      return Qnil;
+    }
+}
+#endif /* HAVE_OSX_USER_NOTIFICATIONS */
+
+
+/***********************************************************************
+			    Initialization
+***********************************************************************/
+void
+syms_of_macappkit (void)
+{
+  /* Notification symbols */
+#if defined(HAVE_OSX_USER_NOTIFICATIONS)
+  DEFSYM (QCbadge, ":badge");
+  DEFSYM (QCsound_name, ":sound-name");
+  DEFSYM (QCsubtitle, ":subtitle");
+  DEFSYM (QCtarget_content, ":target-content");
+  DEFSYM (QCthread_identifier, ":thread-identifier");
+  DEFSYM (Qclose_notification, "close-notification");
+  DEFSYM (Qdismissed, "dismissed");
+  DEFSYM (Qauthorized, "authorized");
+  DEFSYM (Qdenied, "denied");
+  DEFSYM (Qnot_determined, "not-determined");
+  DEFSYM (Qprovisional, "provisional");
+
+  DEFVAR_LISP ("debug-mac-notifications", Vdebug_mac_notifications,
+               doc: /* non-nil enabled debug logging in notification
+                       code */);
+  Vdebug_mac_notifications = Qnil;
+
+  defsubr (&Smac_notification_os_add_category);
+  defsubr (&Smac_notification_os_get_delivered);
+  defsubr (&Smac_notification_os_get_settings);
+  defsubr (&Smac_notification_os_send);
+#endif /* HAVE_OSX_USER_NOTIFICATIONS */
 }
 
 
