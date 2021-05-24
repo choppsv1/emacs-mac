@@ -18093,9 +18093,7 @@ mac_start_lisp_main (void *arg)
   while (argv[argc])
     argc++;
 
-  printf("Calling emacs main\n");
   emacs_main (argc, argv);
-  printf("Done from emacs main\n");
 
   return 0;
 }
