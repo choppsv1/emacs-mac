@@ -2193,38 +2193,6 @@ emacs_windows_need_display_p (void)
  * Notifications
  */
 
-NSData *
-mac_objptr_as_data(Lisp_Object object)
-{
-    void *vdata = lisp_h_XLP(object);
-    return [NSData dataWithBytes:&vdata
-                          length:sizeof(vdata)];
-}
-
-Lisp_Object
-mac_callable_from_data(NSData *data)
-{
-    void *vcallback;
-    if (!data)
-        return Qnil;
-    [data getBytes:&vcallback
-            length:sizeof(vcallback)];
-    return lisp_h_XPL(vcallback);
-}
-
-Lisp_Object
-mac_callable_from_sym_name(NSString *sym_name)
-{
-  if (!sym_name)
-    return Qnil;
-
-  Lisp_Object symbol = Fintern([sym_name UTF8LispString], Qnil);
-  if (Ffboundp(symbol) == Qnil)
-    return Qnil;
-
-  return symbol;
-}
-
 /*
   (mac-notification-send "title" "this is a message"
   :on-close (lambda (what) (message "on-close: %s" what))
@@ -2241,109 +2209,6 @@ mac_callable_from_sym_name(NSString *sym_name)
 
   (mac-delivered-notification)
 */
-
-static Lisp_Object
-mac_notification_clicked_lisp_error(enum nonlocal_exit nle, Lisp_Object o)
-{
-  /* The user should hear about it */
-  Lisp_Object s = CALLN(Fformat, build_string("mac_notification_clicked_lisp_error: %s"), o);
-  if (!NILP(Vdebug_mac_notifications))
-    NSLog(@"%@: %@", @(__func__), [NSString stringWithUTF8LispString:s]);
-  message3(s);
-  return s;
-}
-
-struct _click_args {
-  UNNotificationResponse *response;
-  Lisp_Object lkey, close_reason;
-};
-
-static Lisp_Object
-mac_notification_clicked_lisp(void *arg)
-{
-
-  struct _click_args *args = (struct _click_args *)arg;
-
-  UNNotificationResponse *response = CFBridgingRelease(args->response);
-  UNNotificationContent *content = response.notification.request.content;
-  NSDictionary *options = response.notification.request.content.userInfo;
-  NSString *identifier = response.notification.request.identifier;
-
-  Lisp_Object cb = Fintern(build_string("mac-notification-receive"), Qnil);
-  if (Ffboundp(cb) == Qnil)
-      return Qt;
-
-  Lisp_Object plist = Fplist_put(Qnil, intern(":identifier"), [identifier UTF8LispString]);
-  if (content.categoryIdentifier)
-    plist = Fplist_put(plist, intern(":category"), [content.categoryIdentifier UTF8LispString]);
-  // if (content.threadIdentifier)
-  //   plist = Fplist_put(plist, intern(":thread"), [content.threadIdentifier UTF8LispString]);
-  if (content.targetContentIdentifier)
-    plist = Fplist_put(plist, intern(":target-content"), [content.targetContentIdentifier UTF8LispString]);
-  if (content.title)
-    plist = Fplist_put(plist, intern(":title"), [content.title UTF8LispString]);
-  if (content.subtitle)
-    plist = Fplist_put(plist, intern(":subtitle"), [content.subtitle UTF8LispString]);
-  if (content.body)
-    plist = Fplist_put(plist, intern(":body"), [content.body UTF8LispString]);
-  if (content.badge)
-    plist = Fplist_put(plist, intern(":badge"), make_int([content.badge intValue]));
-
-  if ([response respondsToSelector:@selector(userText)] && [(id)response userText].length)
-      plist = Fplist_put(plist, intern(":user-text"), [[(id)response userText] UTF8LispString]);
-
-  /* Add the user data into the plist */
-  for (NSString *key in options)
-    plist = Fplist_put(plist, Fintern([key UTF8LispString], Qnil), [options[key] UTF8LispString]);
-
-  call3(cb, args->lkey, args->close_reason, plist);
-  return Qt;
-}
-
-static void
-mac_notification_clicked(UNNotificationResponse *response,
-                         BOOL is_dismiss,
-                         NSString *key)
-{
-  NSString *identifier = response.notification.request.identifier;
-
-  MRC_RETAIN(key);
-  MRC_RETAIN(identifier);
-
-  if (!mac_gui_thread_p ())
-    NSLog(@"[!] XXX UNEXPECTED NOT IN GUI THREAD");
-
-  if (!NILP(Vdebug_mac_notifications))
-      NSLog(@"[!] Notification has been acted on");
-
-  mac_within_lisp_deferred (^{
-      if (mac_gui_thread_p ())
-        NSLog(@"[!] XXX UNEXPECTED IN GUI THREAD");
-
-      Lisp_Object lkey = key ? [key UTF8LispString] : Qnil;
-      Lisp_Object close_reason = is_dismiss ? Qdismissed : Qclose_notification;
-
-      BOOL is_old = ![notificationIdentifiers objectForKey:identifier];
-
-      struct _click_args args = {
-        (void*)CFBridgingRetain(response), lkey, close_reason,
-      };
-
-      /* XXX if the user requests input during callback we hang */
-      int owfi = waiting_for_input;
-      waiting_for_input = 0;
-      (void)internal_catch_all (mac_notification_clicked_lisp,
-                                &args,
-                                mac_notification_clicked_lisp_error);
-      waiting_for_input = owfi;
-
-      if (!is_old)
-        [notificationIdentifiers removeObjectForKey:identifier];
-
-      MRC_RELEASE(key);
-      MRC_RELEASE(identifier);
-    });
-}
 
 DEFUN ("mac-notification-os-add-category", Fmac_notification_os_add_category,
        Smac_notification_os_add_category,
@@ -2687,17 +2552,89 @@ usage: (mac-notification-os-send TITLE BODY &rest PARAMS)  */)
 #endif
 }
 
+static void
+mac_notification_clicked(EmacsController *controller,
+                         UNNotificationResponse *response, BOOL is_dismiss,
+                         NSString *key)
+{
+
+    MRC_RETAIN(response);
+    MRC_RETAIN(key);
+
+    if (!mac_gui_thread_p())
+        NSLog(@"[!] XXX UNEXPECTED NOT IN GUI THREAD");
+
+    if (!NILP(Vdebug_mac_notifications))
+        NSLog(@"[!] Notification has been acted on");
+
+    mac_within_lisp_deferred(^{
+      UNNotificationContent *content = response.notification.request.content;
+      NSDictionary *options = response.notification.request.content.userInfo;
+      NSString *identifier = response.notification.request.identifier;
+      Lisp_Object lkey = key ? [key UTF8LispString] : Qnil;
+      Lisp_Object close_reason = is_dismiss ? Qdismissed : Qclose_notification;
+      struct input_event inev;
+
+      Lisp_Object plist =
+          Fplist_put(Qnil, intern(":identifier"), [identifier UTF8LispString]);
+      if (content.categoryIdentifier)
+          plist = Fplist_put(plist, intern(":category"),
+                             [content.categoryIdentifier UTF8LispString]);
+      // if (content.threadIdentifier)
+      //   plist = Fplist_put(plist, intern(":thread"),
+      //   [content.threadIdentifier UTF8LispString]);
+      if (content.targetContentIdentifier)
+          plist = Fplist_put(plist, intern(":target-content"),
+                             [content.targetContentIdentifier UTF8LispString]);
+      if (content.title)
+          plist = Fplist_put(plist, intern(":title"),
+                             [content.title UTF8LispString]);
+      if (content.subtitle)
+          plist = Fplist_put(plist, intern(":subtitle"),
+                             [content.subtitle UTF8LispString]);
+      if (content.body)
+          plist =
+              Fplist_put(plist, intern(":body"), [content.body UTF8LispString]);
+      if (content.badge)
+          plist = Fplist_put(plist, intern(":badge"),
+                             make_int([content.badge intValue]));
+
+      if ([response respondsToSelector:@selector(userText)] &&
+          [(id)response userText].length)
+          plist = Fplist_put(plist, intern(":user-text"),
+                             [[(id)response userText] UTF8LispString]);
+
+      /* Add the user data into the plist */
+      for (NSString *key in options)
+          plist = Fplist_put(plist, Fintern([key UTF8LispString], Qnil),
+                             [options[key] UTF8LispString]);
+
+      /* Add event to handle calling callback in lisp input thread */
+      EVENT_INIT(inev);
+      inev.kind = MAC_APPLE_EVENT;
+      inev.x = Quser_notification_event;
+      inev.y = Qclicked;
+      inev.frame_or_window = mac_event_frame();
+      inev.arg = Fcons(build_string("aevt"), Fcons(lkey, Fcons(close_reason, Fcons(plist, Qnil))));
+      [controller storeEvent:&inev];
+
+      /* Remove the ID (if present) from our in-use IDs */
+      [notificationIdentifiers removeObjectForKey:identifier];
+      MRC_RELEASE(key);
+      MRC_RELEASE(response);
+    });
+}
 
 - (void)userNotificationCenter:(UNUserNotificationCenter *)center
 didReceiveNotificationResponse:(UNNotificationResponse *)response
          withCompletionHandler:(void (^)(void))completionHandler;
 {
   if ([response.actionIdentifier isEqualToString:UNNotificationDefaultActionIdentifier])
-    mac_notification_clicked(response, NO, @"default");
+      mac_notification_clicked(self, response, NO, @"default");
   else if ([response.actionIdentifier isEqualToString:UNNotificationDismissActionIdentifier])
-    mac_notification_clicked(response, YES, nil);
+      mac_notification_clicked(self, response, YES, nil);
   else
-    mac_notification_clicked(response, NO, response.actionIdentifier);
+      mac_notification_clicked(self, response, NO, response.actionIdentifier);
   completionHandler();
 }
 
@@ -18055,6 +17992,8 @@ syms_of_macappkit (void)
   DEFSYM (Qdenied, "denied");
   DEFSYM (Qnot_determined, "not-determined");
   DEFSYM (Qprovisional, "provisional");
+  DEFSYM(Quser_notification_event, "user-notification-event");
+  DEFSYM(Qclicked, "clicked");
 
   DEFVAR_LISP ("debug-mac-notifications", Vdebug_mac_notifications,
                doc: /* non-nil enabled debug logging in notification

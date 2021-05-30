@@ -192,6 +192,16 @@ An action list has the form '(\"key1\" \"Title1\" ...)"
       (funcall on-close id close-reason content))
     (remhash id mac-notification-id-hash)))
 
+(require 'mac-win)
+
+(defun mac-notification-clicked-event (event)
+  (interactive "e")
+  (let ((args (cdr (nth 2 event))))
+    (apply 'mac-notification-receive args)))
+
+(define-key mac-apple-event-map [user-notification-event clicked]
+  'mac-notification-clicked-event)
+
 ;; We are going to override the generic notifications which actually
 ;; only use d-bus
 (require 'notifications)
