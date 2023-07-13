@@ -192,7 +192,7 @@ An action list has the form '(\"key1\" \"Title1\" ...)"
       (funcall on-close id close-reason content))
     (remhash id mac-notification-id-hash)))
 
-(require 'mac-win)
+(require 'term/mac-win)
 
 (defun mac-notification-clicked-event (event)
   (interactive "e")
